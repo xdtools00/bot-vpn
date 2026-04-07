@@ -1,0 +1,778 @@
+#!/bin/bash
+
+###############################################################################
+# Bot VPN - Production Auto Installer
+# 
+# This script automatically installs and configures the Bot VPN application
+# on a production server.
+#
+# Usage:
+#   ./install-production.sh [--version v1.0.0] [--path /var/www/bot-vpn]
+#
+###############################################################################
+
+set -e  # Exit on error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Default configuration
+DEFAULT_INSTALL_PATH="/var/www/bot-vpn"
+DEFAULT_VERSION="latest"
+REPO_OWNER="xdtools00"
+REPO_NAME="bot-vpn"
+NODE_VERSION="20"
+
+# Parse command line arguments
+INSTALL_PATH="${DEFAULT_INSTALL_PATH}"
+VERSION="${DEFAULT_VERSION}"
+MANUAL_CONFIG=false
+SETUP_PUBLIC_ACCESS=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --version)
+            VERSION="$2"
+            shift 2
+            ;;
+        --path)
+            INSTALL_PATH="$2"
+            shift 2
+            ;;
+        --manual-config)
+            MANUAL_CONFIG=true
+            shift
+            ;;
+        --public-access)
+            SETUP_PUBLIC_ACCESS=true
+            shift
+            ;;
+        --help)
+            echo "Bot VPN Production Installer"
+            echo ""
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --version VERSION    Specify version to install (default: latest)"
+            echo "  --path PATH         Installation path (default: /var/www/bot-vpn)"
+            echo "  --manual-config     Setup configuration manually via terminal prompts"
+            echo "  --public-access     Setup firewall and nginx for public web access"
+            echo "  --help              Show this help message"
+            echo ""
+            echo "Example:"
+            echo "  $0 --version v1.0.0 --path /opt/bot-vpn"
+            echo "  $0 --manual-config --public-access"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+###############################################################################
+# Helper Functions
+###############################################################################
+
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+###############################################################################
+# Pre-flight Checks
+###############################################################################
+
+log_info "Starting Bot VPN Production Installer..."
+echo ""
+
+# Check if running as root (not recommended)
+if [ "$EUID" -eq 0 ]; then
+    log_warning "Running as root. This is not recommended for security reasons."
+    log_info "Consider running as a regular user with sudo privileges."
+fi
+
+# Check OS
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    log_success "OS detected: Linux"
+else
+    log_error "Unsupported OS: $OSTYPE"
+    log_info "This script is designed for Linux systems only."
+    exit 1
+fi
+
+###############################################################################
+# Install Dependencies
+###############################################################################
+
+log_info "Checking and installing dependencies..."
+
+# Update package list (if sudo available)
+if command_exists sudo; then
+    log_info "Updating package list..."
+    sudo apt-get update -qq || log_warning "Could not update package list"
+fi
+
+# Check and install Node.js
+if command_exists node; then
+    CURRENT_NODE_VERSION=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
+    log_success "Node.js is already installed (version: $(node --version))"
+    
+    if [ "$CURRENT_NODE_VERSION" -lt "$NODE_VERSION" ]; then
+        log_warning "Node.js version is older than recommended (v${NODE_VERSION})"
+        log_info "Consider upgrading Node.js for better compatibility"
+    fi
+else
+    log_info "Installing Node.js v${NODE_VERSION}..."
+    
+    if command_exists sudo; then
+        # Install Node.js using NodeSource
+        curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+        log_success "Node.js installed successfully"
+    else
+        log_error "Node.js is not installed and sudo is not available"
+        log_info "Please install Node.js manually: https://nodejs.org/"
+        exit 1
+    fi
+fi
+
+# Check npm
+if command_exists npm; then
+    log_success "npm is available (version: $(npm --version))"
+else
+    log_error "npm is not installed"
+    exit 1
+fi
+
+# Check/install required tools
+for tool in curl wget unzip tar sqlite3; do
+    if ! command_exists $tool; then
+        log_info "Installing $tool..."
+        if command_exists sudo; then
+            sudo apt-get install -y $tool
+        else
+            log_error "$tool is required but not installed"
+            exit 1
+        fi
+    fi
+done
+
+# Check/install PM2
+if ! command_exists pm2; then
+    log_info "Installing PM2 process manager..."
+    if command_exists sudo; then
+        sudo npm install -g pm2
+        log_success "PM2 installed successfully"
+    else
+        npm install -g pm2
+        log_success "PM2 installed successfully"
+    fi
+else
+    log_success "PM2 is already installed"
+fi
+
+###############################################################################
+# Download Release
+###############################################################################
+
+log_info "Preparing to download Bot VPN ${VERSION}..."
+
+# Get download URL
+if [ "$VERSION" = "latest" ]; then
+    log_info "Fetching latest release information..."
+    RELEASE_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+    
+    # Get latest version and download URL
+    RELEASE_DATA=$(curl -s "$RELEASE_URL")
+    VERSION=$(echo "$RELEASE_DATA" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    DOWNLOAD_URL=$(echo "$RELEASE_DATA" | grep '"browser_download_url":.*tar.gz"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    
+    if [ -z "$VERSION" ] || [ -z "$DOWNLOAD_URL" ]; then
+        log_error "Could not fetch latest release information"
+        log_info "Please check your internet connection or specify a version manually"
+        exit 1
+    fi
+    
+    log_info "Latest version: ${VERSION}"
+else
+    # Construct download URL for specific version
+    DOWNLOAD_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${VERSION}/bot-vpn-production-${VERSION}.tar.gz"
+fi
+
+log_info "Download URL: ${DOWNLOAD_URL}"
+
+###############################################################################
+# Create Installation Directory
+###############################################################################
+
+log_info "Creating installation directory: ${INSTALL_PATH}"
+
+# Stop and remove existing PM2 process first
+if command_exists pm2; then
+    if pm2 list | grep -q "bot-vpn"; then
+        log_info "Stopping and removing existing bot-vpn process..."
+        pm2 stop bot-vpn 2>/dev/null || true
+        pm2 delete bot-vpn 2>/dev/null || true
+        log_success "Existing process removed"
+    fi
+fi
+
+if [ -d "$INSTALL_PATH" ]; then
+    log_warning "Directory ${INSTALL_PATH} already exists"
+    
+    # Check if it's an existing installation
+    if [ -f "${INSTALL_PATH}/index.js" ]; then
+        log_info "Existing installation detected - will perform clean reinstall"
+        
+        # Backup existing installation
+        BACKUP_PATH="${INSTALL_PATH}.backup.$(date +%Y%m%d_%H%M%S)"
+        log_info "Creating backup: ${BACKUP_PATH}"
+        
+        if command_exists sudo && [ ! -w "$INSTALL_PATH" ]; then
+            sudo cp -r "$INSTALL_PATH" "$BACKUP_PATH"
+        else
+            cp -r "$INSTALL_PATH" "$BACKUP_PATH"
+        fi
+        
+        log_success "Backup created successfully"
+        
+        # Preserve config and data unless manual config is requested
+        if [ "$MANUAL_CONFIG" = false ]; then
+            if [ -f "${INSTALL_PATH}/.vars.json" ]; then
+                log_info "Preserving existing configuration..."
+                cp "${INSTALL_PATH}/.vars.json" "/tmp/.vars.json.preserve"
+            fi
+        else
+            log_info "Manual config requested - will not preserve old configuration"
+        fi
+        
+        if [ -d "${INSTALL_PATH}/data" ]; then
+            log_info "Preserving existing database..."
+            cp -r "${INSTALL_PATH}/data" "/tmp/data.preserve"
+        fi
+        
+        # Remove old installation
+        log_info "Removing old installation..."
+        if command_exists sudo && [ ! -w "$INSTALL_PATH" ]; then
+            sudo rm -rf "$INSTALL_PATH"
+        else
+            rm -rf "$INSTALL_PATH"
+        fi
+        log_success "Old installation removed"
+    fi
+fi
+
+# Create fresh directory
+if command_exists sudo; then
+    sudo mkdir -p "$INSTALL_PATH"
+else
+    mkdir -p "$INSTALL_PATH"
+fi
+
+# Ensure we have write permissions
+if [ ! -w "$INSTALL_PATH" ]; then
+    if command_exists sudo; then
+        sudo chown -R $(whoami):$(whoami) "$INSTALL_PATH"
+    else
+        log_error "No write permission to ${INSTALL_PATH}"
+        exit 1
+    fi
+fi
+
+###############################################################################
+# Download and Extract
+###############################################################################
+
+log_info "Downloading Bot VPN ${VERSION}..."
+
+TEMP_DIR=$(mktemp -d)
+ARCHIVE_FILE="${TEMP_DIR}/bot-vpn-production.tar.gz"
+
+# Download the release
+if ! curl -L -o "$ARCHIVE_FILE" "$DOWNLOAD_URL"; then
+    log_error "Failed to download release"
+    log_info "Please check the version number and your internet connection"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+log_success "Download completed"
+
+# Verify download
+if [ ! -f "$ARCHIVE_FILE" ]; then
+    log_error "Downloaded file not found"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+FILE_SIZE=$(du -h "$ARCHIVE_FILE" | cut -f1)
+log_info "Downloaded file size: ${FILE_SIZE}"
+
+# Extract archive
+log_info "Extracting files to ${INSTALL_PATH}..."
+
+if ! tar -xzf "$ARCHIVE_FILE" -C "$INSTALL_PATH"; then
+    log_error "Failed to extract archive"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+log_success "Files extracted successfully"
+
+# Cleanup temp files
+rm -rf "$TEMP_DIR"
+
+###############################################################################
+# Restore Configuration and Data
+###############################################################################
+
+# Restore preserved config
+if [ -f "/tmp/.vars.json.preserve" ]; then
+    log_info "Restoring previous configuration..."
+    cp "/tmp/.vars.json.preserve" "${INSTALL_PATH}/.vars.json"
+    rm "/tmp/.vars.json.preserve"
+    log_success "Configuration restored"
+fi
+
+# Restore preserved database
+if [ -d "/tmp/data.preserve" ]; then
+    log_info "Restoring previous database..."
+    cp -r "/tmp/data.preserve" "${INSTALL_PATH}/data"
+    rm -rf "/tmp/data.preserve"
+    log_success "Database restored"
+fi
+
+
+###############################################################################
+# Install Dependencies
+###############################################################################
+
+log_info "Installing application dependencies..."
+
+cd "$INSTALL_PATH"
+
+# Install production dependencies only
+if ! npm install --omit=dev; then
+    log_error "Failed to install dependencies"
+    exit 1
+fi
+
+log_success "Dependencies installed successfully"
+
+###############################################################################
+# Setup Application
+###############################################################################
+
+# Create data directory if not exists
+if [ ! -d "${INSTALL_PATH}/data" ]; then
+    log_info "Creating data directory..."
+    mkdir -p "${INSTALL_PATH}/data"
+fi
+
+# Set correct permissions
+chmod 755 "${INSTALL_PATH}/data"
+if [ -f "${INSTALL_PATH}/data/botvpn.db" ]; then
+    chmod 644 "${INSTALL_PATH}/data/botvpn.db"
+fi
+
+# Set permissions for config file if exists
+if [ -f "${INSTALL_PATH}/.vars.json" ]; then
+    chmod 600 "${INSTALL_PATH}/.vars.json"
+fi
+
+###############################################################################
+# PM2 Setup
+###############################################################################
+
+log_info "Setting up PM2 process manager..."
+
+# Stop existing process if running
+if pm2 list | grep -q "bot-vpn"; then
+    log_info "Stopping existing bot-vpn process..."
+    pm2 stop bot-vpn
+    pm2 delete bot-vpn
+fi
+
+# Start with PM2
+log_info "Starting application with PM2..."
+cd "$INSTALL_PATH"
+pm2 start index.js --name bot-vpn
+
+# Save PM2 process list
+pm2 save
+
+# Setup auto-start on reboot (only once)
+if ! pm2 startup | grep -q "already configured"; then
+    log_info "Setting up PM2 auto-start on reboot..."
+    
+    # Get startup command
+    STARTUP_CMD=$(pm2 startup | grep "sudo env" | tail -1)
+    
+    if [ -n "$STARTUP_CMD" ]; then
+        log_info "Please run the following command to enable auto-start:"
+        echo ""
+        echo -e "${GREEN}${STARTUP_CMD}${NC}"
+        echo ""
+    fi
+fi
+
+log_success "PM2 setup completed"
+
+###############################################################################
+# Setup Public Access (Firewall & Nginx)
+###############################################################################
+
+if [ "$SETUP_PUBLIC_ACCESS" = true ]; then
+    log_info "Setting up public access..."
+    echo ""
+    
+    # Get port from .vars.json if exists
+    if [ -f "${INSTALL_PATH}/.vars.json" ]; then
+        APP_PORT=$(grep -oP '"PORT":\s*"\K[^"]+' "${INSTALL_PATH}/.vars.json" 2>/dev/null || echo "50123")
+    else
+        APP_PORT="50123"
+    fi
+    
+    # Setup UFW Firewall
+    if command_exists ufw; then
+        log_info "Configuring UFW firewall..."
+        
+        # Allow SSH (important!)
+        if command_exists sudo; then
+            sudo ufw allow 22/tcp >/dev/null 2>&1
+            log_success "Allowed SSH (port 22)"
+            
+            # Allow application port
+            sudo ufw allow ${APP_PORT}/tcp >/dev/null 2>&1
+            log_success "Allowed application port ${APP_PORT}"
+            
+            # Allow HTTP and HTTPS for nginx
+            sudo ufw allow 80/tcp >/dev/null 2>&1
+            sudo ufw allow 443/tcp >/dev/null 2>&1
+            log_success "Allowed HTTP (80) and HTTPS (443)"
+            
+            # Enable firewall if not already enabled
+            echo "y" | sudo ufw enable >/dev/null 2>&1
+            log_success "UFW firewall enabled"
+        else
+            log_warning "sudo not available, skipping firewall configuration"
+        fi
+    else
+        log_warning "UFW not installed, skipping firewall setup"
+    fi
+    
+    # Setup Nginx
+    if ! command_exists nginx; then
+        log_info "Installing Nginx..."
+        if command_exists sudo; then
+            sudo apt-get update -qq
+            sudo apt-get install -y nginx >/dev/null 2>&1
+            log_success "Nginx installed"
+        else
+            log_warning "Cannot install nginx without sudo"
+        fi
+    fi
+    
+    if command_exists nginx; then
+        log_info "Configuring Nginx reverse proxy..."
+        
+        # Get server IP
+        SERVER_IP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+        
+        # Create nginx config
+        NGINX_CONFIG="/etc/nginx/sites-available/bot-vpn"
+        
+        if command_exists sudo; then
+            sudo tee "$NGINX_CONFIG" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name ${SERVER_IP} _;
+    
+    location / {
+        proxy_pass http://localhost:${APP_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        
+        # Timeout settings
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+}
+EOF
+            
+            # Enable site
+            sudo ln -sf "$NGINX_CONFIG" /etc/nginx/sites-enabled/bot-vpn 2>/dev/null
+            
+            # Remove default site if exists
+            sudo rm -f /etc/nginx/sites-enabled/default 2>/dev/null
+            
+            # Test nginx config
+            if sudo nginx -t >/dev/null 2>&1; then
+                # Restart nginx
+                sudo systemctl restart nginx
+                log_success "Nginx configured and restarted"
+                echo ""
+                log_info "✅ Web interface now accessible at:"
+                echo -e "   ${GREEN}http://${SERVER_IP}${NC}"
+                echo -e "   ${GREEN}http://${SERVER_IP}/setup${NC} (for initial setup)"
+                echo ""
+            else
+                log_error "Nginx configuration test failed"
+            fi
+        else
+            log_warning "Cannot configure nginx without sudo"
+        fi
+    fi
+    
+    echo ""
+fi
+
+###############################################################################
+# Configuration Setup
+###############################################################################
+
+log_info "Mengatur konfigurasi..."
+echo ""
+
+# Check if config already exists and was preserved
+if [ -f "${INSTALL_PATH}/.vars.json" ]; then
+    log_success "File konfigurasi sudah ada (dipertahankan dari instalasi sebelumnya)"
+    echo ""
+    
+    # Redirect stdin for interactive input
+    exec < /dev/tty
+    
+    echo -n "Apakah Anda ingin mengkonfigurasi ulang? (Y/n): "
+    read RECONFIGURE
+    
+    if [[ $RECONFIGURE =~ ^[Yy]$ ]]; then
+        log_info "Akan mengkonfigurasi ulang..."
+        SKIP_CONFIG=false
+    else
+        log_info "Mempertahankan konfigurasi yang ada"
+        SKIP_CONFIG=true
+    fi
+else
+    SKIP_CONFIG=false
+fi
+
+if [ "$SKIP_CONFIG" = false ]; then
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${BLUE}📝 Pengaturan Konfigurasi${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Silakan masukkan untuk Bot Anda:"
+    echo ""
+    
+    # Bot Token - Required
+    BOT_TOKEN_INPUT=""
+    while [ -z "$BOT_TOKEN_INPUT" ]; do
+        echo -n "Silakan masukkan Bot Token Anda (wajib): "
+        read BOT_TOKEN_INPUT
+        if [ -z "$BOT_TOKEN_INPUT" ]; then
+            log_error "Bot Token wajib diisi!"
+        fi
+    done
+    
+    # User ID - Required
+    USER_ID_INPUT=""
+    while [ -z "$USER_ID_INPUT" ]; do
+        echo -n "Silakan masukkan User ID Anda (wajib): "
+        read USER_ID_INPUT
+        if [ -z "$USER_ID_INPUT" ]; then
+            log_error "User ID wajib diisi!"
+        fi
+    done
+    
+    # Admin Username - Required
+    ADMIN_USERNAME_INPUT=""
+    while [ -z "$ADMIN_USERNAME_INPUT" ]; do
+        echo -n "Silakan masukkan Username Admin Anda (wajib): "
+        read ADMIN_USERNAME_INPUT
+        if [ -z "$ADMIN_USERNAME_INPUT" ]; then
+            log_error "Username Admin wajib diisi!"
+        fi
+    done
+    
+    # Group ID - Optional
+    echo -n "Silakan masukkan Group ID Anda (opsional): "
+    read GROUP_ID_INPUT
+    
+    # Store Name - Required
+    NAMA_STORE_INPUT=""
+    while [ -z "$NAMA_STORE_INPUT" ]; do
+        echo -n "Silakan masukkan Nama Toko Anda (wajib): "
+        read NAMA_STORE_INPUT
+        if [ -z "$NAMA_STORE_INPUT" ]; then
+            log_error "Nama Toko wajib diisi!"
+        fi
+    done
+    
+    # Port - Optional with default
+    echo -n "Port (default: 50123): "
+    read PORT_INPUT
+    PORT_INPUT=${PORT_INPUT:-50123}
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${YELLOW}Konfigurasi Payment Gateway (Opsional)${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Catatan: Isi hanya payment gateway yang akan Anda gunakan."
+    echo "         Biarkan kosong jika tidak menggunakannya."
+    echo ""
+    
+    # QRIS Configuration
+    echo -e "${BLUE}Konfigurasi QRIS:${NC}"
+    echo -n "  Data QRIS (opsional): "
+    read DATA_QRIS_INPUT
+    
+    echo ""
+    # Midtrans Configuration
+    echo -e "${BLUE}Konfigurasi Midtrans:${NC}"
+    echo -n "  Merchant ID (opsional): "
+    read MERCHANT_ID_INPUT
+    echo -n "  Server Key (opsional): "
+    read SERVER_KEY_INPUT
+    
+    echo ""
+    # Pakasir Configuration
+    echo -e "${BLUE}Konfigurasi Pakasir:${NC}"
+    echo -n "  Pakasir Slug (opsional): "
+    read PAKASIR_SLUG_INPUT
+    echo -n "  Pakasir API Key (opsional): "
+    read PAKASIR_API_KEY_INPUT
+    
+    echo ""
+    log_info "Menyimpan konfigurasi ke ${INSTALL_PATH}/.vars.json..."
+    
+    # Create .vars.json with user input using printf for safety
+    printf '{\n' > "${INSTALL_PATH}/.vars.json"
+    printf '  "BOT_TOKEN": "%s",\n' "${BOT_TOKEN_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "USER_ID": "%s",\n' "${USER_ID_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "ADMIN_USERNAME": "%s",\n' "${ADMIN_USERNAME_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "GROUP_ID": "%s",\n' "${GROUP_ID_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "NAMA_STORE": "%s",\n' "${NAMA_STORE_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "PORT": "%s",\n' "${PORT_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "DATA_QRIS": "%s",\n' "${DATA_QRIS_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "MERCHANT_ID": "%s",\n' "${MERCHANT_ID_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "SERVER_KEY": "%s",\n' "${SERVER_KEY_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "PAKASIR_SLUG": "%s",\n' "${PAKASIR_SLUG_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '  "PAKASIR_API_KEY": "%s"\n' "${PAKASIR_API_KEY_INPUT}" >> "${INSTALL_PATH}/.vars.json"
+    printf '}\n' >> "${INSTALL_PATH}/.vars.json"
+    
+    # Set proper permissions
+    chmod 600 "${INSTALL_PATH}/.vars.json"
+    
+    log_success "Konfigurasi berhasil disimpan!"
+    echo ""
+fi
+
+# Reset stdin back to default after configuration
+exec 0<&-
+exec 0</dev/stdin 2>/dev/null || true
+
+###############################################################################
+# Post-Installation Steps
+###############################################################################
+
+echo ""
+log_success "✅ Installation completed successfully!"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${GREEN}📦 Bot VPN ${VERSION} has been installed${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "📁 Installation path: ${INSTALL_PATH}"
+echo ""
+
+
+# restart PM2 process to apply any config changes
+log_info "Restarting PM2 process to apply configuration..."
+pm2 restart bot-vpn
+
+# Check application status
+sleep 2
+echo ""
+log_info "Checking application status..."
+pm2 status bot-vpn
+
+echo ""
+log_success "Installation script completed! 🚀"
+echo ""
+
+# Get server IP and port for frontend link
+SERVER_IP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+
+# Get port from .vars.json with better parsing
+if [ -f "${INSTALL_PATH}/.vars.json" ]; then
+    # Try multiple methods to extract port
+    APP_PORT=$(grep '"PORT"' "${INSTALL_PATH}/.vars.json" | grep -oE '[0-9]+' | head -1)
+    if [ -z "$APP_PORT" ]; then
+        APP_PORT="50123"
+    fi
+else
+    APP_PORT="50123"
+fi
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${GREEN}🌐 Akses Web Interface${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "  Setup Konfigurasi:  http://${SERVER_IP}:${APP_PORT}/setup"
+echo "  Atau via localhost: http://localhost:${APP_PORT}/setup"
+echo "  Edit Konfigurasi:   http://${SERVER_IP}:${APP_PORT}/config/edit"
+echo "  Atau via localhost: http://localhost:${APP_PORT}/config/edit"
+echo "  Status :            http://${SERVER_IP}:${APP_PORT}/health"
+echo "  Atau via localhost: http://localhost:${APP_PORT}/health"
+echo ""
+echo "  💡 Tip: Buka link di atas untuk konfigurasi via web interface"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${BLUE}📝 Useful Commands${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "  Check status:    pm2 status bot-vpn"
+echo "  View logs:       pm2 logs bot-vpn"
+echo "  Restart app:     pm2 restart bot-vpn"
+echo "  Stop app:        pm2 stop bot-vpn"
+echo "  Monitor:         pm2 monit"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${BLUE}Setup Configuration${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "  Catatan: Untuk Payment gateway isi sesuai yang Anda miliki dan biarkan kosong untuk lainnya."
+echo "  Edit/Ubah Konfigurasi: sudo nano ${INSTALL_PATH}/.vars.json"
+echo "  Restart App: sudo pm2 restart bot-vpn"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
